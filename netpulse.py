@@ -31,15 +31,44 @@ import customtkinter as ctk
 # --------------------------------------------------------------------------- #
 # Пути и константы
 # --------------------------------------------------------------------------- #
-if getattr(sys, "frozen", False):
-    APP_DIR = os.path.dirname(sys.executable)
-else:
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
-CONFIG_FILE = os.path.join(APP_DIR, "netpulse_config.json")
-LOG_DIR = os.path.join(APP_DIR, "logs")
+__version__ = "1.0.0"
 
 IS_WIN = platform.system() == "Windows"
+FROZEN = getattr(sys, "frozen", False)
+
+if FROZEN:
+    APP_DIR = os.path.dirname(sys.executable)
+    RES_DIR = getattr(sys, "_MEIPASS", APP_DIR)  # ресурсы внутри сборки PyInstaller
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    RES_DIR = APP_DIR
+
+ICON_FILE = os.path.join(RES_DIR, "netpulse.ico")
+
+
+def _writable(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        test = os.path.join(path, f".write_test_{os.getpid()}")
+        with open(test, "w"):
+            pass
+        os.remove(test)
+        return True
+    except Exception:
+        return False
+
+
+# Установленная версия лежит в Program Files, куда без админа писать нельзя —
+# тогда конфиг идёт в %APPDATA%\NetPulse, а логи в Документы\NetPulse\logs.
+# Портативный запуск (папка доступна на запись) хранит всё рядом с программой.
+if FROZEN and IS_WIN and not _writable(APP_DIR):
+    DATA_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "NetPulse")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    CONFIG_FILE = os.path.join(DATA_DIR, "netpulse_config.json")
+    LOG_DIR = os.path.join(os.path.expanduser("~"), "Documents", "NetPulse", "logs")
+else:
+    CONFIG_FILE = os.path.join(APP_DIR, "netpulse_config.json")
+    LOG_DIR = os.path.join(APP_DIR, "logs")
 
 BG = "#0b0e12"
 PANEL = "#141920"
@@ -359,6 +388,9 @@ class NetPulseApp(ctk.CTk):
         self.geometry("1320x800")
         self.minsize(1100, 640)
         self.configure(fg_color=BG)
+        if IS_WIN and os.path.exists(ICON_FILE):
+            # customtkinter ставит свою иконку через ~200 мс — перебиваем после него
+            self.after(300, lambda: self.iconbitmap(ICON_FILE))
 
         self.devices = []          # список dict
         self.outages = []          # список dict
@@ -1460,4 +1492,9 @@ class NetPulseApp(ctk.CTk):
 
 
 if __name__ == "__main__":
+    if IS_WIN:
+        try:  # своя иконка на панели задач, а не иконка python.exe
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NetPulse.NetworkMonitor")
+        except Exception:
+            pass
     NetPulseApp().mainloop()
