@@ -1,8 +1,8 @@
-; Inno Setup скрипт установщика NetPulse для Windows 10/11 (x64)
+﻿; Inno Setup скрипт установщика NetPulse для Windows 10/11 (x64)
 ; Сборка: iscc windows\installer.iss  (сначала соберите exe через build.bat)
 
 #define AppName      "NetPulse"
-#define AppVersion   "1.0.0"
+#define AppVersion   "1.1.0"
 #define AppPublisher "NetPulse"
 #define AppURL       "https://github.com/Escapist27/Net-Pulse---Lightweight-Network-Monitor"
 #define AppExe       "NetPulse.exe"
@@ -18,7 +18,6 @@ AppSupportURL={#AppURL}/issues
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-LicenseFile=..\LICENSE
 OutputDir=Output
 OutputBaseFilename=NetPulse-Setup-{#AppVersion}
 SetupIconFile=..\assets\netpulse.ico
@@ -29,10 +28,15 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
-; Можно ставить и без прав админа — тогда в %LOCALAPPDATA%\Programs
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; Ставим в Program Files (Windows один раз спросит разрешение) — обновляет уже установленную версию
+PrivilegesRequired=admin
 CloseApplications=yes
+; Установка без лишних окон: язык берётся из Windows, сразу ставим и показываем «Готово»
+ShowLanguageDialog=no
+LanguageDetectionMethod=uilanguage
+DisableWelcomePage=yes
+DisableDirPage=yes
+DisableReadyPage=yes
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"

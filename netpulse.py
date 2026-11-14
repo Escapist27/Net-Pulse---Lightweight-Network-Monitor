@@ -103,6 +103,7 @@ SAFE_NAME_RE = re.compile(r"[A-Za-z0-9_.\-]{0,80}")
 # --------------------------------------------------------------------------- #
 STRINGS = {
     "ru": {
+        "endless": "∞ Беспрерывно",
         "period": "Период мониторинга", "u_d": "дн", "u_h": "ч", "u_m": "мин", "sec": "сек",
         "day_short": "д",
         "interval": "Интервал", "threshold": "Потерь до обрыва",
@@ -192,6 +193,7 @@ STRINGS = {
         "soon": "скоро", "light_soon": "Светлая тема появится в следующей версии",
     },
     "en": {
+        "endless": "∞ Non-stop",
         "period": "Monitoring period", "u_d": "d", "u_h": "h", "u_m": "min", "sec": "s",
         "day_short": "d",
         "interval": "Interval", "threshold": "Losses to outage",
@@ -505,6 +507,7 @@ class NetPulseApp(ctk.CTk):
 
         # настройки (переживают перестройку интерфейса)
         self.period = [1, 0, 0]
+        self.endless = False       # пинговать без ограничения по времени, пока не нажмут «Стоп»
         self.interval = 1
         self.threshold = 1
         self.export_dir = LOG_DIR
@@ -640,6 +643,7 @@ class NetPulseApp(ctk.CTk):
     def _read_controls(self):
         self.period = [parse_int(self.cb_days.get()), parse_int(self.cb_hours.get()),
                        parse_int(self.cb_mins.get())]
+        self.endless = bool(self.chk_endless.get())
         self.interval = parse_int(self.cb_interval.get(), 1) or 1
         self.threshold = parse_int(self.cb_threshold.get(), 1) or 1
 
@@ -861,6 +865,15 @@ class NetPulseApp(ctk.CTk):
         self.cb_hours = combo([str(i) for i in range(0, 24)], str(self.period[1]), T("u_h"))
         self.cb_mins = combo([str(i) for i in range(0, 60, 5)], str(self.period[2]), T("u_m"))
 
+        self.chk_endless = ctk.CTkCheckBox(inner, text=T("endless"), font=self.F(14, "bold"),
+                                           text_color=TEXT, fg_color=GREEN, hover_color=GREEN_HOVER,
+                                           border_color=MUTED, checkbox_width=22, checkbox_height=22,
+                                           corner_radius=6, command=self._sync_period_state)
+        if self.endless:
+            self.chk_endless.select()
+        self.chk_endless.pack(side="left", padx=(0, 12))
+        self._sync_period_state()
+
         ctk.CTkFrame(inner, width=1, height=34, fg_color=BORDER).pack(side="left", padx=(2, 12))
 
         ctk.CTkLabel(inner, text=T("interval"), font=self.F(13), text_color=MUTED
@@ -1043,6 +1056,7 @@ class NetPulseApp(ctk.CTk):
         p = cfg.get("period", {})
         self.period = [parse_int(p.get("days", 1), 1), parse_int(p.get("hours", 0)),
                        parse_int(p.get("minutes", 0))]
+        self.endless = bool(cfg.get("endless", False))
         iv = parse_int(cfg.get("interval", 1), 1)
         self.interval = iv if iv in INTERVALS else 1
         th = str(cfg.get("threshold", "1"))
@@ -1068,6 +1082,7 @@ class NetPulseApp(ctk.CTk):
             "lang": LANG,
             "devices": [{"name": d["name"], "host": d["host"], "type": d["type"]} for d in self.devices],
             "period": {"days": self.period[0], "hours": self.period[1], "minutes": self.period[2]},
+            "endless": self.endless,
             "interval": self.interval,
             "threshold": self.threshold,
             "export_dir": self.export_dir,
@@ -1263,12 +1278,22 @@ class NetPulseApp(ctk.CTk):
         else:
             self._start()
 
+    def _sync_period_state(self):
+        """При «Беспрерывно» дни/часы/минуты не нужны — гасим их."""
+        if self.monitor:
+            return
+        state = "disabled" if self.chk_endless.get() else "normal"
+        for w in (self.cb_days, self.cb_hours, self.cb_mins):
+            w.configure(state=state)
+
     def _apply_running_state(self):
         running = self.monitor is not None
         state = "disabled" if running else "normal"
         for w in (self.ent_name, self.ent_host, self.opt_type, self.btn_add, self.btn_del,
-                  self.cb_days, self.cb_hours, self.cb_mins, self.cb_interval, self.cb_threshold):
+                  self.cb_days, self.cb_hours, self.cb_mins, self.cb_interval, self.cb_threshold,
+                  self.chk_endless):
             w.configure(state=state)
+        self._sync_period_state()
         if running:
             self.btn_start.configure(text=T("stop"), fg_color=RED, hover_color=RED_HOVER)
             self.lbl_status.configure(text=T("st_active"))
@@ -1282,7 +1307,7 @@ class NetPulseApp(ctk.CTk):
             return
         self._read_controls()
         days, hours, mins = self.period
-        period = timedelta(days=days, hours=hours, minutes=mins)
+        period = timedelta(0) if self.endless else timedelta(days=days, hours=hours, minutes=mins)
         self._save_config()
 
         # сброс
