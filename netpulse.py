@@ -36,8 +36,42 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_FILE = os.path.join(APP_DIR, "netpulse_config.json")
-LOG_DIR = os.path.join(APP_DIR, "logs")
+def _is_writable(path) -> bool:
+    """Можно ли писать в папку (в Program Files — нельзя без прав администратора)."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".netpulse_write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+# Данные держим рядом с программой (portable-режим). Если туда писать нельзя
+# (установка в Program Files) — уходим в LOCALAPPDATA/NetPulse.
+if _is_writable(APP_DIR):
+    DATA_DIR = APP_DIR
+else:
+    DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA")
+                            or os.path.expanduser("~"), "NetPulse")
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        DATA_DIR = APP_DIR
+
+CONFIG_FILE = os.path.join(DATA_DIR, "netpulse_config.json")
+LOG_DIR = os.path.join(DATA_DIR, "logs")
+
+# первый запуск после установки: подхватить настройки, лежащие рядом с exe
+if DATA_DIR != APP_DIR and not os.path.exists(CONFIG_FILE):
+    try:
+        _old_cfg = os.path.join(APP_DIR, "netpulse_config.json")
+        if os.path.isfile(_old_cfg):
+            shutil.copyfile(_old_cfg, CONFIG_FILE)
+    except Exception:
+        pass
 
 IS_WIN = platform.system() == "Windows"
 
@@ -101,6 +135,7 @@ STRINGS = {
         "bad_host": "Введите корректный IP-адрес или имя хоста.",
         "dup_host": "{h} уже есть в списке.",
         "no_devices": "Сначала добавьте хотя бы одно устройство.",
+        "err_log": "Не удалось создать файл журнала в папке:\n{p}\n\n{e}",
         "ask_stop": "Остановить мониторинг?",
         "ask_exit": "Мониторинг ещё идёт. Остановить и выйти?",
         "r_user": "остановлен пользователем", "r_timer": "завершён по таймеру",
@@ -171,6 +206,7 @@ STRINGS = {
         "bad_host": "Enter a valid IP address or host name.",
         "dup_host": "{h} is already in the list.",
         "no_devices": "Add at least one device first.",
+        "err_log": "Cannot create the log file in:\n{p}\n\n{e}",
         "ask_stop": "Stop monitoring?",
         "ask_exit": "Monitoring is still running. Stop and exit?",
         "r_user": "stopped by user", "r_timer": "finished by timer",
@@ -356,8 +392,6 @@ class NetPulseApp(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("dark")
         self.title("NetPulse — Network Monitor")
-        self.geometry("1320x800")
-        self.minsize(1100, 640)
         self.configure(fg_color=BG)
 
         self.devices = []          # список dict
@@ -378,12 +412,14 @@ class NetPulseApp(ctk.CTk):
         self.export_dir = LOG_DIR
         self.sound = True
 
+        self._ui_scale = 1.0       # масштаб интерфейса, подобранный под экран
         self.F = lambda size, weight="normal": ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
 
         self._setup_tree_styles()
         self._load_config()
         self._build_ui()
 
+        self._fit_to_screen()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_queue)
         self.after(1000, self._tick)
@@ -403,6 +439,39 @@ class NetPulseApp(ctk.CTk):
         if self.monitor:
             self._tick_labels()
 
+    def _fit_to_screen(self):
+        """Подогнать окно под экран: если макет не влезает — уменьшить масштаб интерфейса."""
+        try:
+            sf = ctk.ScalingTracker.get_window_scaling(self) or 1.0
+        except Exception:
+            sf = 1.0
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        avail_w, avail_h = screen_w - 40, screen_h - 90     # поля + панель задач
+
+        # 1. ужимаем масштаб виджетов, пока содержимое не влезет по ширине и высоте
+        scale = self._ui_scale
+        for _ in range(5):
+            self.update()
+            req_w, req_h = self.winfo_reqwidth(), self.winfo_reqheight()
+            factor = min(avail_w / req_w, avail_h / req_h, 1.0)
+            if factor > 0.99:
+                break
+            scale = max(0.62, scale * factor * 0.98)
+            try:
+                ctk.set_widget_scaling(scale)
+            except Exception:
+                break
+
+        self._ui_scale = scale
+
+        # 2. размер окна = по содержимому, но не больше рабочей области
+        self.update()
+        w = min(max(self.winfo_reqwidth() + 4, int(900 * sf)), avail_w)
+        h = min(max(self.winfo_reqheight() + 4, int(600 * sf)), avail_h)
+        x, y = max(0, (screen_w - w) // 2), max(0, (screen_h - h) // 2 - 20)
+        self.minsize(int(min(w, 900 * sf) / sf), int(min(h, 580 * sf) / sf))
+        self.geometry(f"{int(w / sf)}x{int(h / sf)}+{int(x / sf)}+{int(y / sf)}")
+
     def _rebuild_ui(self):
         """Пересобрать весь интерфейс (смена языка). Мониторинг не прерывается."""
         if not self.monitor:
@@ -411,6 +480,7 @@ class NetPulseApp(ctk.CTk):
             w.destroy()
         self._settings_win = None
         self._build_ui()
+        self._fit_to_screen()
 
     def _read_controls(self):
         self.period = [parse_int(self.cb_days.get()), parse_int(self.cb_hours.get()),
@@ -463,14 +533,14 @@ class NetPulseApp(ctk.CTk):
                      text_color=MUTED).pack(anchor="w")
 
         # кнопки справа в шапке
-        self._btn(hdr, T("settings"), self._open_settings, width=140, height=38
+        self._btn(hdr, T("settings"), self._open_settings, width=124, height=38
                   ).pack(side="right")
-        self._btn(hdr, T("location"), self._choose_dir, width=160, height=38
-                  ).pack(side="right", padx=(0, 10))
-        self._btn(hdr, T("open"), self._open_logs, width=120, height=38
-                  ).pack(side="right", padx=(0, 10))
-        self._btn(hdr, T("report"), self._open_report, width=120, height=38
-                  ).pack(side="right", padx=(0, 10))
+        self._btn(hdr, T("location"), self._choose_dir, width=140, height=38
+                  ).pack(side="right", padx=(0, 8))
+        self._btn(hdr, T("open"), self._open_logs, width=108, height=38
+                  ).pack(side="right", padx=(0, 8))
+        self._btn(hdr, T("report"), self._open_report, width=108, height=38
+                  ).pack(side="right", padx=(0, 8))
 
     # ------------------------------------------------------------- управление
     def _build_controls(self):
@@ -482,39 +552,39 @@ class NetPulseApp(ctk.CTk):
         ctk.CTkLabel(inner, text=T("period"), font=self.F(15),
                      text_color=TEXT).pack(side="left", padx=(0, 16))
 
-        def combo(values, default, suffix, width=80):
-            box = ctk.CTkFrame(inner, fg_color=PANEL_2, border_color=BORDER, border_width=1,
-                               corner_radius=10)
-            box.pack(side="left", padx=(0, 10))
-            cb = ctk.CTkComboBox(box, values=values, width=width, height=36,
-                                 font=self.F(15, "bold"), dropdown_font=self.F(13),
-                                 fg_color=PANEL_2, border_width=0, button_color=PANEL_2,
-                                 button_hover_color=BORDER, text_color=TEXT)
+        def combo(values, default, suffix, width=72):
+            cb = ctk.CTkOptionMenu(inner, values=values, width=width, height=36,
+                                   font=self.F(15, "bold"), dropdown_font=self.F(13),
+                                   fg_color=PANEL_2, button_color=PANEL_2,
+                                   button_hover_color=BORDER, text_color=TEXT,
+                                   dropdown_fg_color=PANEL_2, dropdown_hover_color=BORDER,
+                                   dropdown_text_color=TEXT, corner_radius=10,
+                                   anchor="center", dynamic_resizing=False)
             cb.set(default)
-            cb.pack(side="left", padx=(6, 0), pady=2)
+            cb.pack(side="left", padx=(0, 4 if suffix else 10))
             if suffix:
-                ctk.CTkLabel(box, text=suffix, font=self.F(13), text_color=MUTED
-                             ).pack(side="left", padx=(2, 12))
+                ctk.CTkLabel(inner, text=suffix, font=self.F(13), text_color=MUTED
+                             ).pack(side="left", padx=(0, 12))
             return cb
 
         self.cb_days = combo([str(i) for i in range(0, 31)], str(self.period[0]), T("u_d"))
         self.cb_hours = combo([str(i) for i in range(0, 24)], str(self.period[1]), T("u_h"))
         self.cb_mins = combo([str(i) for i in range(0, 60, 5)], str(self.period[2]), T("u_m"))
 
-        ctk.CTkFrame(inner, width=1, height=34, fg_color=BORDER).pack(side="left", padx=10)
+        ctk.CTkFrame(inner, width=1, height=34, fg_color=BORDER).pack(side="left", padx=(2, 12))
 
         ctk.CTkLabel(inner, text=T("interval"), font=self.F(13), text_color=MUTED
                      ).pack(side="left", padx=(4, 8))
         self.cb_interval = combo([f"{i} {T('sec')}" for i in INTERVALS],
-                                 f"{self.interval} {T('sec')}", "", width=100)
+                                 f"{self.interval} {T('sec')}", "", width=92)
 
         ctk.CTkLabel(inner, text=T("threshold"), font=self.F(13), text_color=MUTED
                      ).pack(side="left", padx=(4, 8))
-        self.cb_threshold = combo(THRESHOLDS, str(self.threshold), "", width=70)
+        self.cb_threshold = combo(THRESHOLDS, str(self.threshold), "", width=64)
 
         self.btn_start = ctk.CTkButton(inner, text=T("start"), font=self.F(16, "bold"),
                                        fg_color=GREEN, hover_color=GREEN_HOVER,
-                                       text_color="white", height=46, width=220,
+                                       text_color="white", height=44, width=180,
                                        corner_radius=10, command=self._toggle)
         self.btn_start.pack(side="right")
 
@@ -564,7 +634,7 @@ class NetPulseApp(ctk.CTk):
         self.lbl_dev_title = ctk.CTkLabel(head, text=T("devices", n=0), font=self.F(17, "bold"),
                                           text_color=TEXT)
         self.lbl_dev_title.pack(side="left")
-        self.search = ctk.CTkEntry(head, placeholder_text=T("search"), width=220, height=34,
+        self.search = ctk.CTkEntry(head, placeholder_text=T("search"), width=180, height=34,
                                    fg_color=PANEL_2, border_color=BORDER, corner_radius=10,
                                    font=self.F(13))
         self.search.pack(side="right")
@@ -574,13 +644,13 @@ class NetPulseApp(ctk.CTk):
         tree_wrap.pack(fill="both", expand=True, padx=(12, 6), pady=(0, 6))
         cols = ("type", "name", "host", "status", "lat")
         self.dev_tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
-                                     style="Dev.Treeview", selectmode="extended")
-        for col, key, w, anchor in (("type", "col_type", 100, "w"), ("name", "col_name", 190, "w"),
-                                    ("host", "col_host", 160, "w"),
-                                    ("status", "col_status", 120, "w"),
-                                    ("lat", "col_lat", 90, "center")):
+                                     style="Dev.Treeview", selectmode="extended", height=6)
+        for col, key, w, anchor in (("type", "col_type", 84, "w"), ("name", "col_name", 150, "w"),
+                                    ("host", "col_host", 124, "w"),
+                                    ("status", "col_status", 96, "w"),
+                                    ("lat", "col_lat", 74, "center")):
             self.dev_tree.heading(col, text=T(key), anchor=anchor)
-            self.dev_tree.column(col, width=w, minwidth=60, anchor=anchor, stretch=True)
+            self.dev_tree.column(col, width=w, minwidth=48, anchor=anchor, stretch=True)
         self.dev_tree.tag_configure("online", foreground=TEXT)
         self.dev_tree.tag_configure("offline", foreground=RED_TEXT)
         self.dev_tree.tag_configure("loss", foreground=YELLOW)
@@ -598,20 +668,20 @@ class NetPulseApp(ctk.CTk):
         self.ent_name = ctk.CTkEntry(add, placeholder_text=T("ph_name"), height=36,
                                      fg_color=PANEL, border_color=BORDER, font=self.F(13))
         self.ent_name.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=10)
-        self.ent_host = ctk.CTkEntry(add, placeholder_text=T("ph_host"), width=170, height=36,
+        self.ent_host = ctk.CTkEntry(add, placeholder_text=T("ph_host"), width=140, height=36,
                                      fg_color=PANEL, border_color=BORDER, font=self.F(13))
         self.ent_host.pack(side="left", padx=6, pady=10)
         self.opt_type = ctk.CTkOptionMenu(add, values=[T(f"t_{k}") for k in TYPE_KEYS],
-                                          width=130, height=36, fg_color=PANEL,
+                                          width=118, height=36, fg_color=PANEL,
                                           button_color=PANEL, button_hover_color=BORDER,
                                           font=self.F(13), dropdown_font=self.F(13))
         self.opt_type.set(T("t_pc"))
         self.opt_type.pack(side="left", padx=6, pady=10)
-        self.btn_add = ctk.CTkButton(add, text=T("add"), width=110, height=36,
+        self.btn_add = ctk.CTkButton(add, text=T("add"), width=96, height=36,
                                      font=self.F(13, "bold"), fg_color="#2563eb",
                                      hover_color="#1d4ed8", command=self._add_device)
         self.btn_add.pack(side="left", padx=6, pady=10)
-        self.btn_del = ctk.CTkButton(add, text=T("delete"), width=90, height=36, font=self.F(13),
+        self.btn_del = ctk.CTkButton(add, text=T("delete"), width=84, height=36, font=self.F(13),
                                      fg_color=BTN, hover_color=BTN_HOVER,
                                      command=self._remove_selected)
         self.btn_del.pack(side="left", padx=(0, 10), pady=10)
@@ -635,13 +705,13 @@ class NetPulseApp(ctk.CTk):
         out_wrap.pack(fill="both", expand=True, padx=(12, 6), pady=(0, 12))
         ocols = ("dev", "start", "end", "dur")
         self.out_tree = ttk.Treeview(out_wrap, columns=ocols, show="headings",
-                                     style="Out.Treeview", selectmode="browse")
-        for col, key, w, anchor in (("dev", "col_dev", 200, "w"),
-                                    ("start", "col_start", 120, "center"),
-                                    ("end", "col_end", 120, "center"),
-                                    ("dur", "col_dur", 100, "center")):
+                                     style="Out.Treeview", selectmode="browse", height=6)
+        for col, key, w, anchor in (("dev", "col_dev", 150, "w"),
+                                    ("start", "col_start", 96, "center"),
+                                    ("end", "col_end", 96, "center"),
+                                    ("dur", "col_dur", 84, "center")):
             self.out_tree.heading(col, text=T(key), anchor=anchor)
-            self.out_tree.column(col, width=w, minwidth=70, anchor=anchor, stretch=True)
+            self.out_tree.column(col, width=w, minwidth=56, anchor=anchor, stretch=True)
         self.out_tree.tag_configure("active", foreground=RED_TEXT, font=("Segoe UI", 11, "bold"))
         self.out_tree.tag_configure("closed", foreground="#c9a3a8")
         osb = ctk.CTkScrollbar(out_wrap, command=self.out_tree.yview, fg_color="transparent",
@@ -928,9 +998,15 @@ class NetPulseApp(ctk.CTk):
         self.end_time = self.start_time + period if period.total_seconds() > 0 else None
 
         # лог
-        os.makedirs(LOG_DIR, exist_ok=True)
-        self.log_path = os.path.join(LOG_DIR, f"netpulse_{self.start_time:%Y-%m-%d_%H-%M-%S}.log")
-        self._log_fh = open(self.log_path, "a", encoding="utf-8")
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            self.log_path = os.path.join(
+                LOG_DIR, f"netpulse_{self.start_time:%Y-%m-%d_%H-%M-%S}.log")
+            self._log_fh = open(self.log_path, "a", encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror("NetPulse", T("err_log", p=LOG_DIR, e=exc))
+            self.log_path, self._log_fh = None, None
+            return
         period_txt = (T("period_fmt", d=days, h=hours, m=mins,
                         end=f"{self.end_time:%d.%m.%Y %H:%M:%S}")
                       if self.end_time else T("period_inf"))
