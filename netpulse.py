@@ -20,6 +20,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -152,6 +155,24 @@ STRINGS = {
         "share_note": "Отчёты хранятся файлами .log и .json. Их можно передавать друг другу: "
                       "возьми файлы из папки «Расположение» и скинь кому нужно. "
                       "Открыть их можно в NetPulse (кнопка «📄 Отчёт») или в любом блокноте.",
+        "connector": "🔌 Коннектор", "tg_title": "Коннектор Telegram",
+        "tg_help": "1) В Telegram найди @BotFather → /newbot → придумай имя → скопируй токен сюда.\n"
+                   "2) Открой своего бота и напиши ему любое сообщение (например «привет»).\n"
+                   "3) Нажми «Найти мой chat_id» — поле заполнится само.\n"
+                   "4) Нажми «Тест» — в Telegram должно прийти сообщение.\n"
+                   "5) Включи переключатель и нажми «Сохранить».",
+        "tg_token": "Токен бота (от @BotFather)", "tg_chat": "Chat ID (куда слать)",
+        "tg_find": "🔍 Найти мой chat_id", "tg_test": "📨 Тест", "tg_save": "Сохранить",
+        "tg_enabled": "Слать уведомления в Telegram",
+        "tg_instant": "Отправлять обрывы сразу (при первой же потере пинга, не ждать порог)",
+        "tg_no_token": "Сначала вставь токен бота.",
+        "tg_no_chat": "Бот пока не видит сообщений. Напиши ему что-нибудь в Telegram и нажми ещё раз.",
+        "tg_found": "chat_id найден: {c}", "tg_ok": "Отправлено — проверь Telegram.",
+        "tg_err": "Не получилось:\n{e}", "tg_wait": "⏳ Секунду…",
+        "tg_test_msg": "✅ NetPulse подключён. Сюда будут приходить уведомления об обрывах.",
+        "tg_down": "🔴 {dev} упал\n{host}\nнет связи с {t}",
+        "tg_up": "🟢 {dev} снова в сети\n{host}\nпростой {dur} ({s} – {e})",
+        "tg_late": "\n⏳ доставлено с опозданием (не было интернета)",
         "report": "📄 Отчёт", "open_report": "Открыть отчёт NetPulse",
         "rep_title": "Отчёт: {n}", "rep_started": "Начало", "rep_finished": "Конец",
         "rep_duration": "Длительность", "rep_avail": "Доступность", "rep_outages": "Обрывов",
@@ -223,6 +244,24 @@ STRINGS = {
         "share_note": "Reports are stored as .log and .json files. You can share them: "
                       "take the files from the «Location» folder and send them to anyone. "
                       "Open them in NetPulse (the «📄 Report» button) or in any text editor.",
+        "connector": "🔌 Connector", "tg_title": "Telegram connector",
+        "tg_help": "1) In Telegram open @BotFather → /newbot → pick a name → paste the token here.\n"
+                   "2) Open your bot and send it any message (e.g. \"hi\").\n"
+                   "3) Press \"Find my chat_id\" — the field fills in by itself.\n"
+                   "4) Press \"Test\" — a message should arrive in Telegram.\n"
+                   "5) Turn the switch on and press \"Save\".",
+        "tg_token": "Bot token (from @BotFather)", "tg_chat": "Chat ID (where to send)",
+        "tg_find": "🔍 Find my chat_id", "tg_test": "📨 Test", "tg_save": "Save",
+        "tg_enabled": "Send notifications to Telegram",
+        "tg_instant": "Send outages instantly (on the very first lost ping, don't wait for the threshold)",
+        "tg_no_token": "Paste the bot token first.",
+        "tg_no_chat": "The bot sees no messages yet. Send it something in Telegram and try again.",
+        "tg_found": "chat_id found: {c}", "tg_ok": "Sent — check Telegram.",
+        "tg_err": "Failed:\n{e}", "tg_wait": "⏳ One sec…",
+        "tg_test_msg": "✅ NetPulse connected. Outage notifications will arrive here.",
+        "tg_down": "🔴 {dev} is down\n{host}\nno connection since {t}",
+        "tg_up": "🟢 {dev} is back online\n{host}\ndowntime {dur} ({s} – {e})",
+        "tg_late": "\n⏳ delivered late (internet was down)",
         "report": "📄 Report", "open_report": "Open NetPulse report",
         "rep_title": "Report: {n}", "rep_started": "Started", "rep_finished": "Finished",
         "rep_duration": "Duration", "rep_avail": "Availability", "rep_outages": "Outages",
@@ -372,6 +411,67 @@ def beep():
             pass
 
 
+# ================================================================ Telegram
+class TgFatal(Exception):
+    """Ошибка, которую бесполезно повторять (неверный токен / chat_id)."""
+
+
+def tg_api(token, method, params=None, timeout=10):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params or {}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
+            res = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            desc = json.load(e).get("description", str(e))
+        except Exception:
+            desc = str(e)
+        if e.code == 429 or e.code >= 500:
+            raise RuntimeError(desc)       # временно — можно повторить
+        raise TgFatal(desc)
+    if not res.get("ok"):
+        raise TgFatal(res.get("description", "unknown error"))
+    return res["result"]
+
+
+class TgNotifier:
+    """Фоновая очередь сообщений: если интернета нет — ждёт и досылает потом."""
+
+    RETRY_SEC = 10
+    LATE_SEC = 90
+
+    def __init__(self):
+        self.token = ""
+        self.chat = ""
+        self.enabled = False
+        self.instant = False       # слать «упал» при первой же потере пинга
+        self.q = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @property
+    def ready(self):
+        return bool(self.enabled and self.token and self.chat)
+
+    def send(self, text):
+        if self.ready:
+            self.q.put((text, time.time()))
+
+    def _run(self):
+        while True:
+            text, t0 = self.q.get()
+            while self.token and self.chat:
+                late = T("tg_late") if time.time() - t0 > self.LATE_SEC else ""
+                try:
+                    tg_api(self.token, "sendMessage",
+                           {"chat_id": self.chat, "text": f"🖥 {platform.node()}\n{text}{late}"})
+                    break
+                except TgFatal:
+                    break                  # неверные настройки — не долбим сервер
+                except Exception:
+                    time.sleep(self.RETRY_SEC)   # нет сети — ждём и повторяем
+
+
 def parse_int(value, default=0):
     try:
         return max(0, int(str(value).split()[0]))
@@ -415,12 +515,69 @@ class NetPulseApp(ctk.CTk):
 
         self._setup_tree_styles()
         self._load_config()
+        self._setup_clipboard()
         self._build_ui()
 
         self._fit_to_screen()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_queue)
         self.after(1000, self._tick)
+
+    # ------------------------------------------------------ буфер обмена в полях
+    def _setup_clipboard(self):
+        """Ctrl+V/C/X/A на любой раскладке + меню по правой кнопке во всех полях ввода."""
+        # физические клавиши V, C, X, A (Windows keycode) → действие
+        keymap = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "select_all"}
+
+        def select_all(w):
+            try:
+                w.select_range(0, "end")
+                w.icursor("end")
+            except tk.TclError:
+                pass
+
+        def do(w, action):
+            if action == "select_all":
+                select_all(w)
+            else:
+                w.event_generate(action)
+
+        def on_ctrl_key(event):
+            # на английской раскладке срабатывают стандартные привязки Tk, тут ловим остальные
+            if event.keysym.lower() in ("v", "c", "x", "a"):
+                return None
+            action = keymap.get(event.keycode)
+            if action:
+                do(event.widget, action)
+                return "break"
+            return None
+
+        menu = tk.Menu(self, tearoff=0, bg=PANEL_2, fg=TEXT, activebackground=BORDER,
+                       activeforeground=TEXT, bd=0, font=("Segoe UI", 11))
+        target = {"w": None}
+        ru = LANG == "ru"
+        for label, action in ((("Вырезать" if ru else "Cut"), "<<Cut>>"),
+                              (("Копировать" if ru else "Copy"), "<<Copy>>"),
+                              (("Вставить" if ru else "Paste"), "<<Paste>>"),
+                              (None, None),
+                              (("Выделить всё" if ru else "Select all"), "select_all")):
+            if label is None:
+                menu.add_separator()
+            else:
+                menu.add_command(label=label,
+                                 command=lambda a=action: target["w"] and do(target["w"], a))
+
+        def on_right_click(event):
+            w = event.widget
+            target["w"] = w
+            w.focus_set()   # CTkEntry убирает плейсхолдер при фокусе — иначе вставка ляжет к нему
+            menu.tk_popup(event.x_root, event.y_root)
+            menu.grab_release()
+            return "break"
+
+        for cls in ("Entry", "TEntry"):
+            self.bind_class(cls, "<Control-KeyPress>", on_ctrl_key, add="+")
+            self.bind_class(cls, "<Button-3>", on_right_click, add="+")
 
     # ------------------------------------------------------- сборка интерфейса
     def _build_ui(self):
@@ -539,6 +696,141 @@ class NetPulseApp(ctk.CTk):
                   ).pack(side="right", padx=(0, 8))
         self._btn(hdr, T("report"), self._open_report, width=108, height=38
                   ).pack(side="right", padx=(0, 8))
+        self._btn(hdr, T("connector"), self._open_connector, width=140, height=38
+                  ).pack(side="right", padx=(0, 8))
+
+    # ========================================================= коннектор (Telegram)
+    def _run_bg(self, fn, done):
+        """Выполнить fn() в фоне (сеть), затем done(result, error) в GUI-потоке."""
+        box = {}
+
+        def work():
+            try:
+                box["res"] = fn()
+            except Exception as e:
+                box["err"] = e
+            box["fin"] = True
+
+        def poll():
+            if box.get("fin"):
+                done(box.get("res"), box.get("err"))
+            else:
+                self.after(100, poll)
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, poll)
+
+    def _open_connector(self):
+        win_old = getattr(self, "_conn_win", None)
+        if win_old and win_old.winfo_exists():
+            win_old.lift()
+            win_old.focus_force()
+            return
+        win = ctk.CTkToplevel(self)
+        self._conn_win = win
+        win.title("NetPulse — " + T("tg_title"))
+        win.configure(fg_color=BG)
+        win.resizable(False, False)
+        win.transient(self)
+
+        ctk.CTkLabel(win, text=T("tg_title"), font=self.F(20, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=24, pady=(20, 8))
+        ctk.CTkLabel(win, text=T("tg_help"), font=self.F(12), text_color=MUTED,
+                     justify="left", anchor="w").pack(anchor="w", padx=24, pady=(0, 12))
+
+        card = self._card(win)
+        card.pack(fill="x", padx=24)
+
+        entry_kw = dict(font=self.F(13), height=36, width=440, fg_color=PANEL_2,
+                        border_color=BORDER, text_color=TEXT, corner_radius=10)
+
+        ctk.CTkLabel(card, text=T("tg_token"), font=self.F(13), text_color=MUTED
+                     ).pack(anchor="w", padx=18, pady=(16, 6))
+        e_token = ctk.CTkEntry(card, **entry_kw)
+        e_token.insert(0, self.tg.token)
+        e_token.pack(anchor="w", padx=18)
+
+        ctk.CTkLabel(card, text=T("tg_chat"), font=self.F(13), text_color=MUTED
+                     ).pack(anchor="w", padx=18, pady=(14, 6))
+        crow = ctk.CTkFrame(card, fg_color="transparent")
+        crow.pack(fill="x", padx=18)
+        e_chat = ctk.CTkEntry(crow, **{**entry_kw, "width": 250})
+        e_chat.insert(0, self.tg.chat)
+        e_chat.pack(side="left")
+
+        status = ctk.CTkLabel(card, text="", font=self.F(12), text_color=MUTED,
+                              justify="left", anchor="w", wraplength=440)
+
+        def say(text, color=MUTED):
+            if win.winfo_exists():
+                status.configure(text=text, text_color=color)
+
+        def token():
+            t = e_token.get().strip()
+            if not t:
+                say(T("tg_no_token"), YELLOW)
+            return t
+
+        def find_chat():
+            t = token()
+            if not t:
+                return
+            say(T("tg_wait"))
+
+            def done(updates, err):
+                if err:
+                    return say(T("tg_err", e=err), RED_TEXT)
+                chats = [u[k]["chat"]["id"] for u in reversed(updates or [])
+                         for k in ("message", "edited_message", "channel_post")
+                         if k in u and "chat" in u[k]]
+                if not chats:
+                    return say(T("tg_no_chat"), YELLOW)
+                e_chat.delete(0, "end")
+                e_chat.insert(0, str(chats[0]))
+                say(T("tg_found", c=chats[0]), GREEN)
+
+            self._run_bg(lambda: tg_api(t, "getUpdates"), done)
+
+        def test():
+            t, c = token(), e_chat.get().strip()
+            if not t:
+                return
+            say(T("tg_wait"))
+            self._run_bg(
+                lambda: tg_api(t, "sendMessage", {"chat_id": c, "text": T("tg_test_msg")}),
+                lambda _r, err: say(T("tg_err", e=err), RED_TEXT) if err else say(T("tg_ok"), GREEN))
+
+        self._btn(crow, T("tg_find"), find_chat, width=180).pack(side="left", padx=(10, 0))
+
+        sw = ctk.CTkSwitch(card, text=T("tg_enabled"), font=self.F(13), text_color=TEXT,
+                           progress_color=GREEN)
+        if self.tg.enabled:
+            sw.select()
+        sw.pack(anchor="w", padx=18, pady=(18, 6))
+
+        cb_instant = ctk.CTkCheckBox(card, text=T("tg_instant"), font=self.F(13), text_color=TEXT,
+                                     fg_color=GREEN, hover_color=GREEN_HOVER, border_color=MUTED,
+                                     checkbox_width=22, checkbox_height=22, corner_radius=6)
+        if self.tg.instant:
+            cb_instant.select()
+        cb_instant.pack(anchor="w", padx=18, pady=(8, 6))
+        status.pack(anchor="w", padx=18, pady=(6, 16))
+
+        def save():
+            self.tg.token = e_token.get().strip()
+            self.tg.chat = e_chat.get().strip()
+            self.tg.enabled = bool(sw.get())
+            self.tg.instant = bool(cb_instant.get())
+            self._save_config()
+            win.destroy()
+
+        brow = ctk.CTkFrame(win, fg_color="transparent")
+        brow.pack(fill="x", padx=24, pady=(16, 20))
+        self._btn(brow, T("tg_save"), save, width=130, height=40).pack(side="right")
+        self._btn(brow, T("tg_test"), test, width=110, height=40).pack(side="right", padx=(0, 8))
+        self._btn(brow, T("close"), win.destroy, width=110, height=40).pack(side="left")
+
+        win.after(200, lambda: win.winfo_exists() and (win.lift(), win.focus_force()))
 
     # ------------------------------------------------------------- управление
     def _build_controls(self):
@@ -758,6 +1050,13 @@ class NetPulseApp(ctk.CTk):
         if cfg.get("export_dir"):
             self.export_dir = cfg["export_dir"]
         self.sound = bool(cfg.get("sound", True))
+        if not hasattr(self, "tg"):
+            self.tg = TgNotifier()
+        tg = cfg.get("telegram", {})
+        self.tg.token = str(tg.get("token", "")).strip()
+        self.tg.chat = str(tg.get("chat_id", "")).strip()
+        self.tg.enabled = bool(tg.get("enabled", False))
+        self.tg.instant = bool(tg.get("instant", False))
 
     def _save_config(self):
         if not self.monitor and hasattr(self, "cb_days"):
@@ -773,6 +1072,8 @@ class NetPulseApp(ctk.CTk):
             "threshold": self.threshold,
             "export_dir": self.export_dir,
             "sound": self.sound,
+            "telegram": {"enabled": self.tg.enabled, "instant": self.tg.instant,
+                         "token": self.tg.token, "chat_id": self.tg.chat},
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -987,7 +1288,7 @@ class NetPulseApp(ctk.CTk):
         # сброс
         for d in self.devices:
             d.update(status="pending", lat=None, ok=0, total=0, streak=0, first_fail=None,
-                     outage=None, outage_count=0, downtime=0.0)
+                     outage=None, outage_count=0, downtime=0.0, tg_down_sent=False)
         self.outages.clear()
         self.out_tree.delete(*self.out_tree.get_children())
         self._refresh_dev_tree()
@@ -1445,7 +1746,13 @@ class NetPulseApp(ctk.CTk):
             d["ok"] += 1
             d["lat"] = lat
             if d["outage"]:
-                self._close_outage(d, ts)
+                self._close_outage(d, ts)      # сам пришлёт «снова в сети»
+            elif d.get("tg_down_sent") and d["first_fail"]:
+                # короткий сбой: «упал» уже ушёл сразу, а до порога не дошло — сообщаем, что ожил
+                dur = (ts - d["first_fail"]).total_seconds()
+                self.tg.send(T("tg_up", dev=d["name"], host=d["host"], dur=fmt_dur(dur),
+                               s=f"{d['first_fail']:%H:%M:%S}", e=f"{ts:%H:%M:%S}"))
+            d["tg_down_sent"] = False
             d["status"] = "online"
             d["streak"] = 0
             d["first_fail"] = None
@@ -1454,6 +1761,10 @@ class NetPulseApp(ctk.CTk):
             d["streak"] += 1
             if d["streak"] == 1:
                 d["first_fail"] = ts
+                if self.tg.instant and not d.get("tg_down_sent"):
+                    self.tg.send(T("tg_down", dev=d["name"], host=d["host"],
+                                   t=f"{ts:%d.%m %H:%M:%S}"))
+                    d["tg_down_sent"] = True
             if d["outage"] is None and d["streak"] >= self.threshold:
                 self._open_outage(d, d["first_fail"])
             d["status"] = "offline" if d["outage"] else "loss"
@@ -1468,6 +1779,9 @@ class NetPulseApp(ctk.CTk):
         self._log(T("ev_down"), T("msg_down", dev=f"{d['name']} ({d['host']})"), start)
         if self.sound:
             beep()
+        if not d.get("tg_down_sent"):          # при «сразу» уже отправили на первой потере
+            self.tg.send(T("tg_down", dev=d["name"], host=d["host"], t=f"{start:%d.%m %H:%M:%S}"))
+            d["tg_down_sent"] = True
 
     def _close_outage(self, d, end):
         rec = d["outage"]
@@ -1479,6 +1793,8 @@ class NetPulseApp(ctk.CTk):
             self.out_tree.item(rec["iid"], values=self._out_values(rec), tags=("closed",))
         self._log(T("ev_up"), T("msg_up", dev=f"{d['name']} ({d['host']})", dur=fmt_dur(dur),
                                 s=f"{rec['start']:%H:%M:%S}", e=f"{end:%H:%M:%S}"), end)
+        self.tg.send(T("tg_up", dev=d["name"], host=d["host"], dur=fmt_dur(dur),
+                       s=f"{rec['start']:%H:%M:%S}", e=f"{end:%H:%M:%S}"))
 
     # ============================================================== таймеры
     def _tick(self):
