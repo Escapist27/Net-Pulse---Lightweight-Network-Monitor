@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Личные данные и логи программы
+netpulse_config.json
+logs/
+
+# Сборка Windows
+build/
+dist/
+windows/build/
+windows/dist/
+windows/Output/
+*.spec.bak

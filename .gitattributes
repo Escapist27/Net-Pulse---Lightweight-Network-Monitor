@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Windows-скрипты должны оставаться с CRLF
+*.bat text eol=crlf
+*.iss text eol=crlf
+*.ico binary
+*.png binary

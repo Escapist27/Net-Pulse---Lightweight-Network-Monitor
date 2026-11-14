@@ -1,0 +1,11 @@
+{
+  "lang": "ru",
+  "devices": [
+    { "name": "Router", "host": "192.168.1.1", "type": "router" },
+    { "name": "Google DNS", "host": "8.8.8.8", "type": "server" }
+  ],
+  "period": { "days": 1, "hours": 0, "minutes": 0 },
+  "interval": 1,
+  "threshold": 1,
+  "sound": true
+}
